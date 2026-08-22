@@ -1,7 +1,15 @@
 import torch
 from src.utils import _build_actor_input
 
-def test_agents(env, actor_net, test_steps: int = 500, sequence_length: int = 8, actor_critic_type: str = 'attention_based', device='cpu'):
+def test_agents(
+    env,
+    actor_net,
+    test_steps: int = 500,
+    sequence_length: int = 8,
+    actor_critic_type: str = 'attention_based',
+    algorithm: str = 'PPO',
+    device='cpu'
+    ):
     """
     Tests the trained agents in the environment.
     """
@@ -20,11 +28,21 @@ def test_agents(env, actor_net, test_steps: int = 500, sequence_length: int = 8,
     for _ in range(test_steps):
         obs_list = _build_actor_input(obs_window, actor_critic_type)
         with torch.no_grad():
-            if actor_critic_type == 'Recurrent_based':
-                means, _, hx_act = actor_net(obs_list, hx_act)
-            else:
-                means, _ = actor_net(obs_list)
-        actions = torch.stack([m.squeeze(0) for m in means]).cpu().numpy()
+            if algorithm == 'PPO':
+                if actor_critic_type == 'Recurrent_based':
+                    means, _, hx_act = actor_net(obs_list, hx_act)
+                else:
+                    means, _ = actor_net(obs_list)
+
+                actions = torch.stack([m.squeeze(0) for m in means])
+
+            elif algorithm in ['DDPG', 'MADDPG']:
+                # DDPG actor outputs deterministic actions directly
+                actions = actor_net(obs_list)
+                actions = torch.stack([a.squeeze(0) for a in actions])
+
+        actions = actions.cpu().numpy()
+
         obs, _, _, done = env.step(actions)
 
         for i in range(n_agents):

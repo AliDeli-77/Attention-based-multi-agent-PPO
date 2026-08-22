@@ -1,242 +1,282 @@
 import torch
-import torch.nn as nn
 import os
 import numpy as np
 import matplotlib.pyplot as plt
 from collections import deque
 from typing import Optional
-from src.utils import RolloutBufferMA, ObsNormalizer, _build_actor_input, linear_schedule
+
+from src.Algorithms import AlgorithmFactory
+from src.utils import ObsNormalizer
 from src.test import test_agents
+from src.plotting import plot_trajectories
+from src.utils import linear_schedule
 
-def ppo_update(policy_net, value_net, roll_buf: 'RolloutBufferMA', policy_opt, value_opt, clip_val: float, ent_coef: float, vf_coef: float, n_epochs: int, batch_size: int, actor_critic_type: str = 'attention_based', target_kl: float | None = None):
-    """
-    PPO update function with KL-divergence tracking and early stopping.
-    """
-    target_kl = target_kl or clip_val
-    device, N = roll_buf.device, roll_buf.n_agents
-    kl_running_sum, n_mb = 0.0, 0
 
-    for _ in range(n_epochs):
-        for batch in roll_buf.get_batches(batch_size):
-            obs_b = batch['obs']
-            if actor_critic_type == 'MLP_based':
-                obs_list = [obs_b[:, i, -1] for i in range(N)]
-            else:
-                obs_list = [obs_b[:, i] for i in range(N)]
+def train_agents(
+    env,
+    actor_net,
+    critic_net,
+    cfg,
+    *,
+    device,
+    save_root: str = "results",
+    tag_suffix: str = ""
+):
 
-            means, stds = (policy_net(obs_list) if actor_critic_type != 'Recurrent_based' else policy_net(obs_list, None)[:2])
-            means, stds = torch.stack(means), torch.stack(stds)
-
-            logp_new, entropy = [], []
-            for i in range(N):
-                dist = torch.distributions.Normal(means[i], stds[i])
-                lp = dist.log_prob(batch['actions'][:, i]).sum(-1, keepdim=True)
-                logp_new.append(lp)
-                entropy.append(dist.entropy().mean())
-            logp_new = torch.stack(logp_new)
-            entropy = torch.stack(entropy).mean()
-
-            with torch.no_grad():
-                approx_kl = (batch['logp_old'].transpose(0, 1) - logp_new).mean()
-                kl_running_sum += approx_kl.item()
-                n_mb += 1
-                if approx_kl > 1.5 * target_kl:
-                    print(f"Early-stop PPO epoch — KL {approx_kl:.4f} > 1.5×target")
-                    return kl_running_sum / n_mb
-
-            ratios = torch.exp(logp_new - batch['logp_old'].transpose(0, 1))
-            adv = batch['adv'].transpose(0, 1).unsqueeze(-1)
-            surr1 = ratios * adv
-            surr2 = torch.clamp(ratios, 1 - clip_val, 1 + clip_val) * adv
-            actor_loss = -torch.min(surr1, surr2).mean() - ent_coef * entropy
-
-            if actor_critic_type == 'MLP_based':
-                critic_in = obs_b[:, :, -1, :].permute(1, 0, 2)
-            else:
-                critic_in = obs_b.permute(1, 0, 2, 3)
-            new_vals = (value_net(critic_in) if actor_critic_type != 'Recurrent_based' else value_net(critic_in)[0])
-            val_loss = (new_vals - batch['returns']).pow(2)
-            v_clip = batch['values'] + torch.clamp(new_vals - batch['values'], -clip_val, clip_val)
-            val_loss2 = (v_clip - batch['returns']).pow(2)
-            critic_loss = 0.5 * torch.max(val_loss, val_loss2).mean()
-
-            loss = actor_loss + vf_coef * critic_loss
-            policy_opt.zero_grad(); value_opt.zero_grad(); loss.backward()
-            nn.utils.clip_grad_norm_(policy_net.parameters(), 10.0)
-            nn.utils.clip_grad_norm_(value_net.parameters(), 10.0)
-            policy_opt.step(); value_opt.step()
-
-    return kl_running_sum / max(1, n_mb)
-
-def train_agents(env, actor_net: nn.Module, critic_net: nn.Module, *, total_timesteps: int = 2_000_000, rollout_steps: int = 2048 * 4, n_epochs: int = 10, mini_batch_size: int = 4096, sequence_length: int = 20, gamma: float = 0.995, lam: float = 0.95, clip_val: float = 0.1, ent_coef: float = 0.01, vf_coef: float = 0.5, lr: float = 1e-3, normalize_reward: bool = False, normalize_obs: bool = False, plot_interval: int = 600_000, test_interval: int = 600_000, test_steps: int = 1024 * 4, actor_critic_type: str = 'attention_based', device: Optional[torch.device] = None, save_root: str = "results"):
-    """
-    Main training routine for PPO.
-    """
     os.makedirs(save_root, exist_ok=True)
-    device = device or torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    actor_net.to(device); critic_net.to(device)
 
-    lr_sched = linear_schedule(lr)
-    ent_sched = linear_schedule(ent_coef, 0.0)
+    
+    actor_net.to(device)
+    critic_net.to(device)
 
-    opt_pi = torch.optim.Adam(actor_net.parameters(), lr=lr)
-    opt_v = torch.optim.Adam(critic_net.parameters(), lr=lr)
+    # =========================
+    # Create Algorithm
+    # =========================
+    algorithm = AlgorithmFactory.create(
+        cfg.algorithm,
+        actor_net,
+        critic_net,
+        cfg,
+        device
+    )
 
-    n_agents, obs_dim, act_dim = env.num_agents, env.obs_shape, 6
-    buffer = RolloutBufferMA(rollout_steps, obs_dim, act_dim, n_agents, sequence_length, device)
+    # =========================
+    # Optional Normalization
+    # =========================
+    obs_norm = ObsNormalizer(cfg.obs_dim).to(device) if cfg.normalize_obs else None
 
-    obs_norm = ObsNormalizer(obs_dim).to(device) if normalize_obs else None
-    obs_t = torch.tensor(env.reset(), dtype=torch.float32, device=device)
-    if normalize_obs: obs_norm.update(obs_t)
-    obs_window = obs_t.unsqueeze(1).repeat(1, sequence_length, 1).clone()
+    lr_sched_actor  = linear_schedule(cfg.actor_lr)
+    lr_sched_critic  = linear_schedule(cfg.critic_lr)
+    ent_sched = linear_schedule(cfg.entropy_coef)
 
-    if actor_critic_type == 'Recurrent_based':
-        hx_act = actor_net.init_hidden(n_agents, device=device)
-        hx_val = critic_net.init_hidden(device=device)
-    else:
-        hx_act = hx_val = None
 
-    rewards_log, collisions_log, success_log = deque(maxlen=20), deque(maxlen=20), deque(maxlen=20)
-    smoothd_reward, smoothd_collisions, smoothd_success = [], [], []
-    global_step, ep_ret, next_plot, next_test = 0, 0.0, plot_interval, test_interval
+    # =========================
+    # Logging
+    # =========================
+    
+    rewards_log, smoothd_reward = deque(maxlen=20), []
+    collisions_log, smoothd_collisions = deque(maxlen=20), []
+    success_log, smoothd_success = deque(maxlen=20), []
 
-    while global_step < total_timesteps:
-        for _ in range(rollout_steps):
-            obs_list = _build_actor_input(obs_window, actor_critic_type)
-            with torch.no_grad():
-                if actor_critic_type == 'Recurrent_based':
-                    means, stds, hx_act = actor_net(obs_list, hx_act)
+    
+    dist_reward_log, smoothd_dist_reward = deque(maxlen=20), []
+    col_penalty_log, smoothd_col_penalty = deque(maxlen=20), []
+
+    global_step = 0
+    next_test = 0
+    ep_ret = 0.0
+    ep_dist_ret = 0
+    ep_col_ret = 0 
+
+    # =========================
+    # Reset Environment
+    # =========================
+    obs = torch.tensor(env.reset(), dtype=torch.float32, device=device)
+    action = torch.zeros(cfg.num_agents, cfg.act_dim).to(device)
+
+    obs_window = obs.unsqueeze(1).repeat( 1, cfg.sequence_length, 1).clone()
+    act_window = action.unsqueeze(1).repeat( 1, cfg.sequence_length, 1).clone()
+
+
+    if obs_norm is not None:
+        obs_norm.update(obs)
+
+    # =========================
+    # Main Loop
+    # =========================
+    while global_step < cfg.total_timesteps:
+
+        # -------- Collect Experience --------
+        for _ in range(cfg.rollout_steps):
+
+            if cfg.algorithm == "PPO":
+                action, logp = algorithm.select_action(obs_window)
+                if env.point_mass:
+                    action = torch.clamp(action, -env.max_force, env.max_force)
                 else:
-                    means, stds = actor_net(obs_list)
+                    action[:, :3] = torch.clamp(action[:, :3], -env.max_force, env.max_force)  
+                    action[:, 3:] = torch.clamp(action[:, 3:], -env.max_moment, env.max_moment)  
+                act_window = torch.roll(act_window, shifts=-1, dims=1)
+                act_window[:, -1] = action
+                observation_window = torch.cat([obs_window, act_window], dim = -1)
+                with torch.no_grad():
+                    if cfg.actor_critic_type == "MLP_based":
+                            value = algorithm.critic((observation_window[:,-1].unsqueeze(1)))
+                    else:                   
+                            value = algorithm.critic(observation_window.unsqueeze(1))
 
-            actions, logps = [], []
-            for i in range(n_agents):
-                dist = torch.distributions.Normal(means[i], torch.clamp(stds[i], 1e-3, 1.0))
-                a = dist.sample()
-                lp = dist.log_prob(a).sum()
-                actions.append(a.squeeze(0)); logps.append(lp.unsqueeze(0))
+                next_obs, reward, reward_components, done = env.step(action.cpu().numpy())
 
-            actions_t = torch.stack(actions)
-            logps_t = torch.stack(logps)
+                algorithm.store_transition(
+                    obs_window,
+                    act_window,
+                    logp,
+                    torch.tensor(reward, device=device),
+                    value.squeeze(0),
+                    torch.tensor(done, device=device)
+                )
 
-            with torch.no_grad():
-                if actor_critic_type == 'attention_based':
-                    vals = critic_net(obs_window.unsqueeze(1)).squeeze(0)
-                elif actor_critic_type == 'Recurrent_based':
-                    vals, hx_val = critic_net(obs_window.unsqueeze(1), hx_val)
-                    vals = vals.squeeze(0)
+            else:  # DDPG
+                action = algorithm.select_action(obs_window)
+                if cfg.point_mass:
+                    action = torch.clamp(action, -env.max_force, env.max_force)
                 else:
-                    vals = critic_net(obs_window[:, -1].unsqueeze(1)).squeeze(0)
+                    action[:, :3] = torch.clamp(action[:, :3], -env.max_force, env.max_force)  
+                    action[:, 3:] = torch.clamp(action[:, 3:], -env.max_moment, env.max_moment)
+                next_obs, reward, reward_components, done = env.step(action.cpu().numpy())
+                act_window = torch.roll(act_window, shifts=-1, dims=1)
+                act_window[:, -1] = action
+                next_obs_window = torch.roll(obs_window, shifts=-1, dims=1)
+                next_obs_window[:, -1] = torch.tensor(next_obs, device=device)
 
-            next_obs, reward, _, done = env.step(actions_t.cpu().numpy())
-            if normalize_reward:
-                reward = env.normalize_rewards(reward)
+                algorithm.store_transition(
+                    obs_window.clone(),
+                    act_window,
+                    torch.tensor(reward, device=device),
+                    next_obs_window.clone(),
+                    torch.tensor(done, device=device)
+)
 
-            buffer.add(obs_window, actions_t, torch.tensor(reward, dtype=torch.float32, device=device), torch.tensor(done, dtype=torch.float32, device=device), vals, logps_t)
 
-            if actor_critic_type == 'Recurrent_based':
-                d = torch.as_tensor(done, dtype=torch.float32, device=device)
-                masks = (1.0 - d).view(-1, 1, 1)
-                hx_act = [h * masks[i] for i, h in enumerate(hx_act)]
-                hx_val = hx_val * masks.mean()
-
-            obs_t = torch.tensor(next_obs, dtype=torch.float32, device=device)
-            if normalize_obs: obs_norm.update(obs_t)
+            obs = torch.tensor(next_obs, dtype=torch.float32, device=device)
             obs_window = torch.roll(obs_window, shifts=-1, dims=1)
-            obs_window[:, -1] = obs_t
+            obs_window[:, -1] = obs
+
+            if obs_norm is not None:
+                obs_norm.update(obs)
 
             ep_ret += float(np.mean(reward))
+            ep_dist_ret += float(np.mean(reward_components['distance_to_destination']))
+            ep_col_ret += float(np.mean(reward_components['collision_with_agents']))
             global_step += 1
 
-            if all(done):
-                rewards_log.append(ep_ret); ep_ret = 0.0
-                collisions_log.append(env.collision_count)
-                success_log.append(env.success_count)
-                obs_t = torch.tensor(env.reset(), dtype=torch.float32, device=device)
-                if normalize_obs: obs_norm.update(obs_t)
-                obs_window = obs_t.unsqueeze(1).repeat(1, sequence_length, 1).clone()
-                if actor_critic_type == 'Recurrent_based':
-                    hx_act = actor_net.init_hidden(n_agents, device=device)
-                    hx_val = critic_net.init_hidden(device=device)
+            # if all(done):
+            #     rewards_log.append(ep_ret); ep_ret = 0.0
+            #     dist_reward_log.append(ep_dist_ret); ep_dist_ret = 0.0
+            #     col_penalty_log.append(ep_col_ret); ep_col_ret = 0.0
+
+            #     collisions_log.append(env.collision_count)
+            #     success_log.append(env.success_count)
+
+            #     obs = torch.tensor(env.reset(), dtype=torch.float32, device=device)
+            #     obs_window = obs.unsqueeze(1).repeat(
+            #         1, cfg.sequence_length, 1
+            #     ).clone()
+
+            #     if obs_norm is not None:
+            #         obs_norm.update(obs)
+            #     break
+        
+
+            
 
         rewards_log.append(ep_ret); ep_ret = 0.0
-        if len(rewards_log) == 20:
-            smoothd_reward.append(sum(rewards_log) / 20)
-            smoothd_collisions.append(sum(collisions_log) / 20)
-            smoothd_success.append(sum(success_log) / 20)
-            rewards_log.clear(); collisions_log.clear(); success_log.clear()
+        dist_reward_log.append(ep_dist_ret); ep_dist_ret = 0.0
+        col_penalty_log.append(ep_col_ret); ep_col_ret = 0.0
+        collisions_log.append(env.collision_count)
+        success_log.append(env.success_count)
 
-        with torch.no_grad():
-            if actor_critic_type == 'attention_based':
-                last_val = critic_net(obs_window.unsqueeze(1)).squeeze(0)
-            elif actor_critic_type == 'Recurrent_based':
-                last_val, _ = critic_net(obs_window.unsqueeze(1), hx_val)
-                last_val = last_val.squeeze(0)
-            else:
-                last_val = critic_net(obs_window[:, -1].unsqueeze(1)).squeeze(0)
+        if len(rewards_log) == rewards_log.maxlen:
+            smoothd_reward.append(sum(rewards_log) / rewards_log.maxlen)
+            smoothd_dist_reward.append(sum(dist_reward_log) / dist_reward_log.maxlen)
+            smoothd_col_penalty.append(sum(col_penalty_log) / col_penalty_log.maxlen)
+            smoothd_collisions.append(sum(collisions_log) / collisions_log.maxlen)
+            smoothd_success.append(sum(success_log) / success_log.maxlen)
 
-        buffer.compute_returns_adv(last_val, gamma, lam)
+            rewards_log.clear()
+            dist_reward_log.clear()
+            col_penalty_log.clear()
+            collisions_log.clear()
+            success_log.clear()
 
-        progress = global_step / total_timesteps
-        lr_now = lr_sched(progress)
-        ent_now = ent_sched(progress)
+        # -------- Update Algorithm --------
 
-        for pg in opt_pi.param_groups: pg['lr'] = lr_now
-        for pg in opt_v.param_groups: pg['lr'] = lr_now
+        algorithm.update()
 
-        mean_kl = ppo_update(actor_net, critic_net, buffer, opt_pi, opt_v, clip_val, ent_now, vf_coef, n_epochs, mini_batch_size, actor_critic_type, target_kl=clip_val)
-        print(f"[step {global_step:>8}]  KL={mean_kl:.4f}  ent_coef={ent_now:.5f}")
+        progress = global_step / cfg.total_timesteps
 
-        buffer.ptr = buffer.full = 0
+        new_actor_lr  = lr_sched_actor(1 - progress)
+        new_critic_lr = lr_sched_critic(1 - progress)
+        cfg.entropy_coef = ent_sched(1 - progress)
 
-        if global_step >= next_plot:
+        for pg in algorithm.actor_optim.param_groups:
+            pg["lr"] = new_actor_lr
+
+        for pg in algorithm.critic_optim.param_groups:
+            pg["lr"] = new_critic_lr
+
+        if cfg.algorithm == "DDPG":
+            cfg.tau = cfg.tau * (1.0 - progress)
+
+
+        obs = torch.tensor(env.reset(), dtype=torch.float32, device=device)
+        obs_window = obs.unsqueeze(1).repeat(1, cfg.sequence_length, 1).clone()
+
+        action = torch.zeros(cfg.num_agents, cfg.act_dim).to(device)
+        act_window = action.unsqueeze(1).repeat( 1, cfg.sequence_length, 1).clone()
+
+        if obs_norm is not None:
+            obs_norm.update(obs)
+
+
+        
+
+        # -------- Plot & save --------
+        if global_step >=next_test:
+            print(f"[step {global_step:>8}] ")
             plt.figure(figsize=(6, 4))
-            plt.plot(smoothd_reward, '-o')
-            plt.xlabel('Rollout #'); plt.ylabel('Cumulative return')
-            plt.title(f'Training @ step {global_step}')
-            plt.show(); next_plot += plot_interval
-
-        if global_step >= next_test:
-            trajs = test_agents(env, actor_net, test_steps, sequence_length, actor_critic_type, device)
-            fig = plt.figure(figsize=(6, 5))
-            ax = fig.add_subplot(111, projection='3d')
-            theta = np.linspace(0, 2 * np.pi, 30)
-            z_vals = np.linspace(0, env.grid_size, 2)
-            theta, z_mesh = np.meshgrid(theta, z_vals)
-
-            for ox, oy, _ in env.obstacles:
-                x_cyl = ox + env.a * np.cos(theta)
-                y_cyl = oy + env.a * np.sin(theta)
-                ax.plot_surface(x_cyl, y_cyl, z_mesh, color='red', alpha=0.25, linewidth=0, label='_nolegend_')
-
-            u = np.linspace(0, 2 * np.pi, 30)
-            v = np.linspace(0, np.pi, 15)
-            u, v = np.meshgrid(u, v)
-
-            for i, traj in enumerate(trajs):
-                traj = np.array(traj)
-                (ln,) = ax.plot(traj[:, 0], traj[:, 1], traj[:, 2], label=f'Agent {i}')
-                col = ln.get_color()
-                ax.scatter(traj[0, 0], traj[0, 1], traj[0, 2], marker='o', s=50, color=col)
-                cx, cy, cz = env.destinations[i]
-                r = env.a
-                x = cx + r * np.cos(u) * np.sin(v)
-                y = cy + r * np.sin(u) * np.sin(v)
-                z = cz + r * np.cos(v)
-                ax.plot_wireframe(x, y, z, color=col, alpha=0.35)
-
-            ax.set_xlim(0, env.grid_size); ax.set_ylim(0, env.grid_size); ax.set_zlim(0, env.grid_size)
-            ax.set_xlabel('X'); ax.set_ylabel('Y'); ax.set_zlabel('Z')
-            ax.set_title(f'{actor_critic_type}: trajectories @ step {global_step}')
-            ax.legend(loc='upper left')
+            plt.plot(smoothd_reward, "-o")
+            plt.xlabel("Rollout #")
+            plt.ylabel("Cumulative return")
+            plt.title(f"Training ({cfg.algorithm}) @ step {global_step}")
             plt.tight_layout()
-            plt.show()
+            plt.savefig(f"{save_root}/Cumulative_return.png", dpi=300, bbox_inches="tight")
+            plt.show(block=False) 
+            plt.pause(1) 
+            plt.close()  
 
-            next_test += test_interval
+            trajs = test_agents(
+                env,
+                actor_net,
+                cfg.test_steps,
+                cfg.sequence_length,
+                cfg.actor_critic_type,
+                cfg.algorithm,
+                device
+            )
 
-            tag = f"{actor_critic_type}"
+            plot_trajectories(
+                env,
+                trajs,
+                cfg.actor_critic_type,
+                global_step,
+                save_root
+            )
+            next_test += cfg.test_interval
+
+            tag = cfg.algorithm if tag_suffix == "" else f"{cfg.algorithm}_{tag_suffix}"
             torch.save(actor_net.state_dict(), f"{save_root}/actor_{tag}.pth")
             torch.save(critic_net.state_dict(), f"{save_root}/critic_{tag}.pth")
-            np.savez(os.path.join(save_root, f"results_{tag}.npz"), smoothd_reward=np.asarray(smoothd_reward), smoothd_collisions=np.asarray(smoothd_collisions), smoothd_success=np.asarray(smoothd_success))
 
-    return smoothd_reward, smoothd_collisions, smoothd_success
+            np.savez(
+                os.path.join(save_root, f"results_{tag}.npz"),
+                smoothd_reward = np.asarray(smoothd_reward),
+                smoothd_dist_reward = np.asarray(smoothd_dist_reward),
+                smoothd_col_penalty = np.asarray(smoothd_col_penalty),
+                smoothd_collisions = np.asarray(smoothd_collisions),
+                smoothd_success=np.asarray(smoothd_success),
+            )
+
+    tag = cfg.algorithm if tag_suffix == "" else f"{cfg.algorithm}_{tag_suffix}"
+    torch.save(actor_net.state_dict(), f"{save_root}/actor_{tag}.pth")
+    torch.save(critic_net.state_dict(), f"{save_root}/critic_{tag}.pth")
+
+    np.savez(
+        os.path.join(save_root, f"results_{tag}.npz"),
+        smoothd_reward = np.asarray(smoothd_reward),
+        smoothd_dist_reward = np.asarray(smoothd_dist_reward),
+        smoothd_col_penalty = np.asarray(smoothd_col_penalty),
+        smoothd_collisions = np.asarray(smoothd_collisions),
+        smoothd_success=np.asarray(smoothd_success),
+    )
+    return smoothd_reward
