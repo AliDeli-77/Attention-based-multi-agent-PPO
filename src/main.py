@@ -178,7 +178,7 @@ if __name__ == "__main__":
         gae_lambda=0.95,
         clip=0.2,
         ppo_epochs=2,
-        batch_size=2048,
+        batch_size=4096,
         value_coef=0.5,
         entropy_coef=0.01,
         actor_lr=1e-3,
